@@ -1,0 +1,1079 @@
+---
+title: "Bike Sharing Analysis"
+author: "Stephen D. Wells"
+date: "April 5, 2015"
+output: html_document
+---
+
+```{r, echo=FALSE}
+# REQUIRED LIBRARIES
+library(RColorBrewer)
+library(scales) # trans_new() function
+library(zoo, quietly=TRUE, warn.conflicts=FALSE) # for rollmeans() in calculating density probabilities
+library(reshape2)
+library(ggplot2)
+library(dplyr, warn.conflicts=FALSE)
+library(caret)
+library(e1071)
+suppressPackageStartupMessages(library(rattle, quietly=TRUE, warn.conflicts=FALSE)) # ensure that you have 'rpart.plot' installed first
+suppressPackageStartupMessages(library(gridExtra))
+suppressWarnings(library(ggthemes))
+```
+
+```{r, echo=FALSE}
+# LOAD AND ORGANIZE THE DATA
+
+# Keeping this in a single block ensures that anything that alters the data is
+#     in this one chunk.  The advantage is that you can run this one chunk to
+#     test out new theories in your console without having to search through
+#     the various sections.  The data comes preformatted in this case.
+
+fetchData <- function (file = "train") { # this can be used for the test file too...
+  mydata <- read.csv(
+    paste("../data/",file, ".csv", sep="")
+    )
+    
+  # Ensure date formats
+  mydata$datetime <- as.POSIXct(
+    mydata$datetime, format="%Y-%m-%d %H:%M:%S")
+
+  # factors
+  mydata$season <- factor(
+    mydata$season, labels=c("Spring","Summer","Fall","Winter"))
+
+  mydata$weather <- factor(
+    mydata$weather, labels=c('Clear','Mist','Rain','Heavy Rain'))
+  
+  # Additional Columns
+  mydata$hour <- as.integer(
+    format(
+      strptime(mydata$datetime, "%Y-%m-%d %H:%M:%S"), "%H"))
+
+  mydata$month <- as.integer(
+    format(
+      strptime(mydata$datetime, "%Y-%m-%d %H:%M:%S"), "%m"))
+
+  mydata$year <- as.integer(
+    format(
+      strptime(mydata$datetime, "%Y-%m-%d %H:%M:%S"), "%Y"))
+
+  mydata$yearmonth <- as.integer(
+    format(
+      strptime(mydata$datetime, "%Y-%m-%d %H:%M:%S"), "%Y%m"))
+
+return(mydata) # I NEED IT BACK!!! :-P
+}
+
+# only through an abundance of professional fortitude was I 
+#  able to stick with the variable name 'bikeShare' when I 
+#  so very much wished to shorten it to just two letters...
+bikeShare <- fetchData()
+
+# Summary Ridership Counts
+  bikeShare.atemp_by_riders <-
+    bikeShare %>%
+    group_by(atemp = round(atemp)) %>%
+    summarise(
+      riders_mean = mean(count),
+      riders_median = median(count),
+      riders_min = min(count),
+      riders_max = max(count),
+      n = n()) %>%
+  arrange()
+
+bikeShare.yearmonth_count_mean <-
+  bikeShare %>%
+  group_by(year, month) %>%
+  summarise(count_mean = mean(count)) %>%
+  arrange(year, month)
+
+bikeShare.yearmonth_count_mean.wide <- 
+  dcast(bikeShare.yearmonth_count_mean, month ~ year, value.var="count_mean")
+  
+bikeShare.yearmonth_count_mean.wide$growth <- 
+    (bikeShare.yearmonth_count_mean.wide$"2012" - bikeShare.yearmonth_count_mean.wide$"2011")
+  
+bikeShare.yearmonth_count_mean.wide$mean_growth_rate <- 
+    (bikeShare.yearmonth_count_mean.wide$growth / bikeShare.yearmonth_count_mean.wide$"2012")
+
+```
+
+# Analysis
+
+## Univariate Plots
+
+### Dimensions, Column Names and Structure
+```{r, echo=FALSE}
+dim(bikeShare)
+colnames(bikeShare)
+str(bikeShare)
+```
+
+### Factor Variables
+#### Weather
+```{r, echo=FALSE}
+levels(bikeShare$weather)
+```
+
+#### Seasons
+```{r, echo=FALSE}
+levels(bikeShare$season)
+```
+
+### Summary
+```{r, echo=FALSE}
+summary(bikeShare)
+```
+
+### Standard Deviations for Numerical Data
+```{r, echo=FALSE}
+sds <- c("count", "registered", "casual", "windspeed", "humidity", "atemp", "temp")
+for (i in 1:length(sds)) {
+  print(paste(sds[i], ": ", round(sd(bikeShare[[sds[i]]]), digits=2), sep=""))
+}
+```
+
+#### Date Ranges
+
+The date range is from
+`r strftime(min(bikeShare$datetime), "%b %d, %Y %I%P")` to `r strftime(max(bikeShare$datetime), "%b %d, %Y %I%P")`
+and given that 2012 was a leap year we should have 
+`r options(scipen=999); 
+format(difftime(max(bikeShare$datetime), min(bikeShare$datetime), units="hours"), big.mark=",")`
+between the two dates. However, we have only `r format(nrow(bikeShare), big.mark=",")` entries which means that we can count on 
+either this being a sample of the timeframe (likely as it's called *train.csv*) or that maybe they excluded hours 
+that contained no riders.  We can test for that possiblity...
+
+```{r}
+sum(bikeShare$count == 0)
+```
+
+So they either don't display hours that have no riders or there are always
+riders. Nevertheless, we can count on the fact that we certainly don't have
+data for every hour between our selected dates.  In fact we only have
+`r options(scipen=999); 
+round(nrow(bikeShare) /
+      as.numeric(
+          difftime(max(bikeShare$datetime), min(bikeShare$datetime),
+                   units="hours")),
+      digits=4) * 100`%      
+of the data.
+
+#### Weather
+Since there is a single entry for **Heavy Rain** in the **Weather** column we
+will either have to drop that column or combine it with **Rain** if we are to
+use it.  
+
+#### Season
+```{r, echo=FALSE} 
+summary(bikeShare$season)
+```
+It's interesting how closely matched the seasons are. If this was just entries
+that contained riders and not sample data from the timeframe, you wouldn't
+expect those numbers to be so closely inline with one another. Then again, even
+as a sample they must have sampled from each season to come up with these
+results.
+
+# Ridership
+As mentioned earlier, all of the entries contain at least one rider and each
+entry represents one hour. Median ridership is 145 with a maximum number of
+riders of 977.
+
+#### Distributions
+At first glance it looks like environmental variables (*temp*, *atemp* ,
+*humidity* and *windspeed*) are close to a normal distribution whereas all the
+ridership variables (casual, registered and count) are very right skewed. Once
+we start plotting we'll see this better.
+
+### Basic Histogram
+
+```{r, echo=FALSE}
+qplot(x=bikeShare$count,
+      binwidth=35,
+      xlab="Number of Riders",
+      ylab="frequency",
+      main="Ridership Frequency")
+```
+
+After transforming the long tailed data to get a better understanding of the
+ridership...
+
+```{r, echo=FALSE}
+cuberoot_trans = function() trans_new('cuberoot',
+                                      transform=function(x) x^(1/3),
+                                      inverse=function(x)x^3)
+
+ggplot(aes(x=count), data=bikeShare) +
+  geom_histogram(binwidth=0.3) +
+  scale_x_continuous(trans=cuberoot_trans(),
+                     breaks=c(0,50,100,150,200,400,600,800,1000)) + 
+  geom_density() +
+  ggtitle("Ridership Frequency Transformed (log3)") +
+  ylab("Recorded Hours") + 
+  xlab("Number of Riders")
+```
+
+The transformed ridership appears unimodal with a rise as we move past
+50 to the peak at around 175 riders after which we have a steady decline.
+
+There are really three sections to this dataset, Time, Weather and Ridership.
+Since we've just reviewed ridership let's take a glance at the other two.
+
+```{r, echo=FALSE}
+hist(bikeShare$datetime, breaks=40, xlab="Datetime", freq=TRUE, col="grey")
+```
+
+The spread across the dates seems fairly constant over the period of
+`r round(max(bikeShare$datetime) - min(bikeShare$datetime))` days. 
+
+```{r, echo=FALSE}
+h <- hist(bikeShare$temp, 
+          breaks=55,
+          xlab="Temperature",
+          freq=TRUE, col="grey",
+          main="Histogram of Temperatures")
+xfit <- seq(min(bikeShare$temp), max(bikeShare$temp), length=40)
+yfit <- dnorm(xfit, mean=mean(bikeShare$temp), sd=sd(bikeShare$temp))
+yfit <- yfit * diff(h$mids[1:2]) * length(bikeShare$temp)
+lines(xfit, yfit, col=2, lwd=4)
+```
+
+After overlaying the distribution line with the temperature, we concluded that
+the temperature and dates don't really tell us much since the expected
+distribution appears parametric.
+
+*Which I guess is something - though not exactly interesting.*
+
+```{r, echo=FALSE}
+ggplot(aes(x=weather), data=bikeShare) +
+  geom_histogram(binwidth=2, aes(fill=weather)) +
+  theme(legend.title=element_blank(), legend.position=c(0.7,0.8)) +
+  ylab("Frequency") +
+  ggtitle("Weather Frequency")
+```
+
+It looks like the weather is pretty good in DC.  This will skew our results
+with so many clear periods in relation to others when we compare the impact of
+weather to ridership.  In other words, if we state that there are more riders
+during clear hours we need to account for the fact that there are that many
+more clear hours as well.  We'll use averages when dealing with  weather in
+this case.
+
+## Bivariate Plots
+
+*note: the ggpairs output took a very long time to run on this over 10k line
+       dataset. I included an export of the file labeled as 'ggpairs.png' as
+       part of this package.*
+
+Let's see how the ridership stacks up by month.
+
+```{r, echo=FALSE}
+ggplot(data=bikeShare, aes(x=month, y=count, fill=factor(month))) +
+  scale_x_discrete(
+    limits=c("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov",
+             "Dec")) +
+  scale_y_continuous(breaks=seq(0,1000,100)) + 
+  geom_boxplot() +
+  ylab("Ridership") +
+  xlab("Month") +
+  theme(legend.position = "none") 
+```
+
+Though there are more cyclists in the summer months as you might expect, the
+increase from January to December is likely a reflection of growth in the
+company as a whole over the two year period we are looking at.
+
+Let's break that out over the two year mark to see if that's the case.
+
+```{r, echo=FALSE}
+
+p1 <- ggplot(data=bikeShare[bikeShare$yearmonth < 201200,],
+             aes(x=month, y=count, fill=factor(month))) +
+  scale_x_discrete(limits=c("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug",
+                            "Sep","Oct","Nov","Dec")) +
+  scale_y_continuous(breaks=seq(0,1000,100), limits=c(1,1000)) + 
+  geom_boxplot() +
+  ggtitle("2011") +
+  ylab("Ridership") +
+  xlab("Month") +
+  theme(legend.position = "none") 
+
+p2 <- ggplot(data=bikeShare[bikeShare$yearmonth > 201200,], 
+             aes(x=month, y=count, fill=factor(month))) +
+  scale_x_discrete(limits=c("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug",
+                            "Sep","Oct","Nov","Dec")) +
+  scale_y_continuous(breaks=seq(0,1000,100)) + 
+  geom_boxplot() +
+  ggtitle("2012") +
+  ylab("Ridership") +
+  xlab("Month") +
+  theme(legend.position = "none")
+
+grid.arrange(p1, p2, ncol=1)
+```
+
+There was an increase in ridership, let's quantifiy that a bit.
+
+```{r, echo=FALSE}
+p1 <- ggplot(aes(x=month, y=count), data=bikeShare) +
+  geom_line(data=bikeShare[bikeShare$yearmonth > 201200,],
+            stat="summary", fun.y=mean, aes(color="2012"), size=2) +
+  geom_line(data=bikeShare[bikeShare$yearmonth < 201200,],
+            stat="summary", fun.y=mean, aes(color="2011"), size=2) +
+  geom_bar(data=bikeShare.yearmonth_count_mean.wide, aes(y=growth, x=month),
+           stat="identity", alpha=0.15) +
+  scale_x_discrete(limits=c("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug",
+                            "Sep","Oct","Nov","Dec")) +
+  ggtitle("Monthly Growth between 2011-2012") + 
+  ylab("Mean Ridership") +
+  xlab("Month") +
+  theme(legend.title=element_blank(), legend.position=c(0.1,0.8)) +
+  annotate("text", x=5, y=20, label="mean change between years")
+
+p2 <- ggplot(aes(x=month, y=mean_growth_rate),
+             data=bikeShare.yearmonth_count_mean.wide) +
+  scale_x_discrete(limits=c("Jan","Feb","Mar","Apr","May","Jun","Jul","Aug",
+                            "Sep","Oct","Nov","Dec")) +
+  scale_y_continuous(breaks=seq(0,1,.1), 
+                     limits=c(0,1), 
+                     labels=c("0%","10%","20%","30%","40%","50%","60%","70%",
+                              "80%","90%","100%")) +
+  ggtitle("YoY Mean Growth Rates by Month") +
+  xlab("Month") +
+  ylab("Growth Rate") +
+  geom_area(color="red", fill="red", alpha=0.15)
+
+grid.arrange(p2, p1, ncol=1)
+```
+
+Total ridership increased by 
+`r round((sum(bikeShare[bikeShare$year == 2012,]$count) -
+          sum(bikeShare[bikeShare$year == 2011,]$count)) /
+          sum(bikeShare[bikeShare$year == 2011,]$count) * 100,
+        digits=2)`% from 2011 through 2012, confirming the 
+suggestion that growth rates contributed to the difference
+in our boxplots.
+
+```{r, echo=FALSE}
+ggplot(aes(x=weather, y=count), data=bikeShare) +
+  geom_point(stat="summary", fun.y=median, aes(color=weather, size=count)) +
+  scale_size_continuous(range = c(5,5), guide=FALSE) +
+  geom_line(aes(group="summary"), stat="summary", fun.y=median, linetype=2) +
+  scale_color_discrete(guide=FALSE) +
+  ggtitle("Median Ridership by Weather") +
+  ylab("Median Number of Riders") +
+  xlab("Weather")
+```
+
+Here we normalized the ridership using the median number of riders as
+precipitation increases.  As a cyclist, I always suspected that we have
+behavorial traits that lean toward the masochistic, but clearly DC riders are a
+very strange lot.  Ridership decreases as we would suspect from clear weather
+to mist to rain, but then when the weather gets tough the tough get going.  In
+a flash of inspriation though I recall that there is only one data point for
+*Heavy Rain* so I recreated the graph this way.
+
+```{r, echo=FALSE}
+
+ggplot(aes(x=weather, y=count), 
+       data=bikeShare[bikeShare$weather != "Heavy Rain",]) +
+  geom_point(stat="summary", fun.y=median, aes(color=weather, size=5)) +
+  scale_size_continuous(range = c(5,5), guide=FALSE) +
+  geom_line(aes(group="summary"), stat="summary", fun.y=median, linetype=1) +
+  scale_color_discrete(guide=FALSE) +
+  ggtitle("Median Ridership by Weather") +
+  ylab("Median Number of Riders") +
+  xlab("Weather")
+
+```
+
+These cyclists aren't the animals I first suspected. Given these traits, I
+would venture to guess that a lot of riders just got caught in the rain.  Since
+the weather seems to be a factor of how much precipitation was inflicted on our
+riders, maybe humidity would be a better indicator.
+
+```{r, echo=FALSE}
+summary(bikeShare$humidity)
+ggplot(aes(y=count, x=humidity), data=bikeShare[bikeShare$humidity > 20,]) +
+  geom_point(stat="summary", fun.y=mean) + 
+  geom_smooth(method="lm") + 
+  scale_x_continuous(breaks=seq(0,100,5)) +
+  ggtitle("Number of Riders as Humidity Increases") +
+  xlab("Humidity") +
+  ylab("Mean Ridership")
+```
+
+The number of riders certainly drops off as humidity increases.
+
+*DC has so few
+entries that have humidity levels under 20 
+(`r round(100 * (sum(bikeShare$humidity < 20) /
+          sum(bikeShare$humidity >= 20)),
+          digits=2)`%) and since the data was skewed by these outliers, I felt
+it was safe to remove them.*
+
+This is an interesting graph and I'd like to look into it a little more.  I
+wonder if this affects casual riders or registered riders more.
+
+```{r, echo=FALSE}
+
+# this graph is a good way to compare the impact between total riders and
+# another continuous variable, it then breaks it up into groups of registered
+# vs casual riders so we'll house it in a reusable function for the next few
+# graphs.
+
+# USAGE:
+#   column_name: the name of the column we are studying
+#   data: use this to subset the data if needed
+compareRiders <- function(column_name="humidity", data=bikeShare) {
+  
+  display_name <- paste(toupper(substring(column_name, 1, 1)), 
+                        substring(column_name, 2),
+                        sep="", collaspe=" ")
+  
+  p1 <- ggplot(aes(y=data[,"count"], x=data[,column_name]),
+               data=data,
+               environment = environment()) +
+    geom_point(stat="summary", fun.y=mean) + 
+     
+    scale_x_continuous(breaks=seq(0,100,5)) +
+    geom_smooth(method="lm") + 
+    ggtitle(paste("Total Number of Riders as", display_name, "Increases",
+                  sep="")) +
+    xlab(display_name) +
+    ylab("Mean Ridership")
+  
+  p2 <- ggplot(aes(y=data[,"count"], x=data[,column_name]),
+               data=data,
+               environment = environment()) +
+    geom_point(color="red", aes(y=registered), stat="summary", fun.y=mean) + 
+    geom_smooth(method="lm", aes(y=registered)) +
+    geom_point(color="navy", aes(y=casual), stat="summary", fun.y=mean) +
+    geom_smooth(method="lm", aes(y=casual)) +
+    scale_x_continuous(breaks=seq(0,100,5)) +
+    ggtitle("Registered (red) vs Casual (blue) Riders") +
+    xlab(display_name) +
+    ylab("Mean Ridership")
+    
+  grid.arrange(p1, p2, ncol=1)
+}
+
+compareRiders(column_name="humidity", data=bikeShare[bikeShare$humidity > 20,])
+```
+
+The slope of the casual line looks much flatter than the registered users.
+
+```{r, echo=FALSE}
+lm(registered ~ humidity, data=bikeShare)$coefficients
+lm(casual ~ humidity, data=bikeShare)$coefficients
+```
+
+Does this lead us to believe that humidity levels affect registered users
+moreso than casual ones? That seems counterintuitive. I would suspect that
+registered riders use the bike system for commuting and would be required to
+ride into work no matter what the humidity, whereas casual riders would be
+more spontaneous and therefore pursuaded moreso by changes in humidity. The
+data is showing us an unexpected relationship.
+
+Since humidity is something you can't really see before you head outside, I'm
+left wondering if windspeed would play a greater role.
+
+```{r, echo=FALSE}
+compareRiders("windspeed")
+```
+
+The plot thickens.  It's plain to see that there's a shift in the data when we
+move from one end of the graph to the other.  Since the shift seems to flatten
+out when the windspeed reaches around 25-30 mph and a linear model looks like
+a good fit on the left, let's plot two different linear models on each section.
+
+```{r, echo=FALSE}
+p1 <- ggplot(aes(y=count, x=windspeed), data=bikeShare) +
+  geom_point(stat="summary", fun.y=mean) + 
+  geom_smooth(data=bikeShare[bikeShare$windspeed <= 30,], method="lm") +
+  geom_smooth(data=bikeShare[bikeShare$windspeed >= 25,], method="lm") +
+  scale_x_continuous(breaks=seq(0,100,5)) +
+  ggtitle("Total Number of Riders as Windspeed Increases") +
+  xlab("Windspeed") +
+  ylab("Mean Ridership")
+
+p2 <- ggplot(aes(y=count, x=windspeed), data=bikeShare) +
+  geom_point(color="red", aes(y=registered), stat="summary", fun.y=mean) + 
+  geom_smooth(data=bikeShare[bikeShare$windspeed <= 30,], method="lm",
+              aes(y=registered)) + 
+  geom_smooth(data=bikeShare[bikeShare$windspeed >= 25,], method="lm",
+              aes(y=registered)) +
+  geom_point(color="navy", aes(y=casual), stat="summary", fun.y=mean) +
+  geom_smooth(data=bikeShare[bikeShare$windspeed <= 30,], method="lm",
+              aes(y=casual)) +
+  geom_smooth(data=bikeShare[bikeShare$windspeed >= 25,], method="lm",
+              aes(y=casual)) +
+  scale_x_continuous(breaks=seq(0,100,5)) +
+  ggtitle("Registered (red) vs Casual (blue) Riders") +
+  xlab("Windspeed") +
+  ylab("Mean Ridership")
+
+grid.arrange(p1, p2, ncol=1)
+```
+
+Riders don't mind the wind and seem to actually graviate toward riding when it
+starts blowing. However, at around 25-30 mph, they start to drop off.  It's
+much more of a deterrent for registered riders than the casual group.  As the
+windspeed increases, the mean becomes more sporatic too, which may be an
+indicator that we are seeing fewer entries in that range.
+
+```{r, echo=FALSE}
+ggplot(aes(factor(round(atemp/5)*5), count), data=bikeShare) +
+  scale_x_discrete(breaks = seq(0,45,5)) +
+  geom_boxplot(aes(fill = factor(round(atemp/5)*5))) +
+  guides(fill = guide_legend(title="Temp")) +
+  xlab('"Feels Like" Temperature (C)') +
+  ylab("Ridership") +
+  ggtitle("Ridership by Temperature (C)")
+```
+
+As the "Feels Like" temperature increases so do the number of riders...
+
+```{r, echo=FALSE}
+# Average Ridership per "Feels Like" Temperature
+ggplot(aes(x = atemp, y = riders_mean), 
+       data=bikeShare.atemp_by_riders) +
+  scale_x_discrete(breaks=seq(0,50, 5)) +
+  geom_point(size=2) + 
+  geom_line(color="blue") + 
+  geom_smooth(method="loess",color="red") +
+  ggtitle('Average Ridership per "Feels Like" Temperature') +
+  xlab('"Feels Like" Temperature (C)') +
+  ylab("Mean Number of Riders")
+```
+
+It looks like it's starting to level out at around 45C, otherwise as the
+temperature goes up we have more riders. There must be a point of diminishing
+returns, but we need higher temperatures to find it.
+
+## Multivariate Plots
+
+```{r, echo=FALSE}
+ggplot(aes(x=round(as.integer(hour)/2)*2, y=count), data=bikeShare) +
+  facet_wrap(~season) +
+  geom_point(aes(color=round(atemp)),
+             alpha=0.5,
+             position=position_jitter(h=0)) +
+  geom_smooth(method="loess",
+              color="blue",
+              size=2) +
+  geom_line(stat='summary',
+            fun.y='quantile',
+            probs=.5,
+            linetype=1,
+            color="black",
+            size=1.5) +
+  geom_line(stat='summary',
+            fun.y='quantile',
+            probs=.9,
+            linetype=2,
+            color="red",
+            size=1.5) +
+  geom_line(stat='summary',
+            fun.y='quantile',
+            probs=.1,
+            linetype=2,
+            color="red",
+            size=1.5) +
+  xlab(paste("Hours\nRed dashed lines are 90% and 10% quantitles\n",
+             "The smoothing line is blue\nSolid black shows 50% quantitles")) +
+  ylab("Riders") +
+  labs(color='"Feels Like" temperature (celcius)') +
+  theme_few() +
+  theme(legend.position="top") +
+  ggtitle("Ridership by Hour per Season") +
+  scale_colour_gradient2(low="navyblue", mid="blue3", high="olivedrab1")
+```
+
+As the weather warms the scatter plot turns green, while it turns blue as it
+cools. We can see the growth of the company altering our results slightly as
+there are fewer riders in the Spring compared to Winter.  Most notable though
+is the bimodal pattern we see in the data. Since this is hourly we are almost
+assuredly looking at the impact of commuters. It's interesting that the 
+spike in commuter traffic is smaller in the mornings than in the evenings,
+which may indicate that though commuters go into work at different times
+most leave at around the same time.
+
+```{r, echo=FALSE}
+ggplot(aes(x=month, y=count),
+       data=bikeShare[bikeShare$weather != 'Heavy Rain',]) +
+  facet_wrap(~weather) +
+  geom_line(stat='summary', fun.y=mean, aes(group="summary")) +
+  geom_point(stat='summary', fun.y=mean, aes(group="summary")) +
+  geom_line(stat='summary',
+            fun.y=mean,
+            linetype=2,
+            aes(y=registered, group='summary', color='Registered')) +
+  geom_line(stat='summary',
+            fun.y=mean,
+            linetype=2,
+            aes(y=casual, group='summary', colour='Casual')) +
+  ggtitle("Average Ridership per Month by Weather") +
+  xlab("Month") +
+  ylab("Mean Riders") +
+  scale_x_discrete(
+    breaks=c("01","02","03","04","05","06","07","08","09","10","11","12"),
+    limits=c("01","02","03","04","05","06","07","08","09","10","11","12"),
+    labels=c("J","F","M","A","M","J","J","A","S","O","N","D")) +
+  scale_y_continuous(breaks=seq(0,300,50)) +
+  theme(legend.title=element_blank()) +
+  ggtitle("Average Ridership per Month by Weather") +
+  xlab("Month") +
+  ylab("Mean Riders")
+```
+
+After removing the data point for *Heavy Rain*, we split up the results to
+review the monthly impact of casual vs. registered riders.
+
+Highlights:
+
+* Riders prefer a clear day and can even stand a little mist, but regardless
+of the month or season they are heavily impacted by rain.
+* February riders are not influenced by worsening weather as much as March
+riders.
+* People love to ride in September, but only if it's clear.
+* August is a strange month as more people are found riding in the mist than
+when it's clear.
+* Wether it's clear or misty has very little importance to ridership in
+February and December but it's vital to riders in April or May
+* Though riders care little about mist in December, if it's raining the mean
+plummets.
+* Most casual riders don't start riding until March and only then if it's not
+raining.
+
+This has me thinking about how the different months can make a person
+feel like the weather may be better or worse as you enter it.  I know
+from personal experience that 15C can feel warm in January and bitter 
+cold in September.  I wonder how riders percieve the actual temperature
+based on the season.
+
+```{r, echo=FALSE}
+p1 <- ggplot(aes(x=temp, y=count), data=bikeShare) +
+  geom_line(aes(color=season), stat="summary", fun.y=mean, size=2) +
+  theme(legend.title=element_blank(), legend.position=c(0.1,0.8)) +
+  xlab("Temperature") +
+  ylab("Mean Riders")
+p2 <- ggplot(aes(x=round(temp/2)*2, y=count), data=bikeShare) +
+  geom_line(aes(color=season), stat="summary", fun.y=mean, size=2) +
+  theme(legend.title=element_blank(), legend.position=c(0.1,0.8)) +
+  xlab("Temperature") +
+  ylab("Mean Riders") +
+  ggtitle("Smoothed")
+
+grid.arrange(p1, p2, ncol=1, main="Ridership by Temperature per Season")
+```
+
+I expected some of these results, but two things jump out at me.
+First, I would expect that Winter would contain the coldest temps
+and that Summer would contain the hottest.  However...
+
+```{r, echo=FALSE}
+bikeShare %>%
+  group_by(season) %>%
+  summarise(min = min(temp),
+            mean = mean(temp),
+            median = median(temp),
+            max = max(temp), n = n()) %>%
+  arrange(min)
+
+ggplot(aes(x=season, y=temp), data=bikeShare) +
+  geom_boxplot(aes(fill=season)) +
+  theme(legend.position="none") +
+  xlab("Season") +
+  ylab("Temperature") +
+  ggtitle("Temperature by Season")
+```
+
+Looking closely, Spring has the lowest Temperature
+(`r min(bikeShare[bikeShare$season == "Spring",]$temp)`C)
+and Fall has the highest
+(`r max(bikeShare[bikeShare$season == "Fall",]$temp)`C).  Many times data can
+tell you things you don't intuitively understand.  When we think about the
+Summer or Winter seasons as being the extremes you might think it's because the
+average number of days are warmer in Summer or colder in Winter.  The data from
+Washington, DC doesn't support this.  If it was closer to the equator it might
+make more sense as temperature extremes grow as you reach the poles but this is
+unexplainable...
+
+Maybe the "Feels Like" temperature is different?
+
+```{r, echo=FALSE}
+bikeShare %>%
+  group_by(season) %>%
+  summarise(min = min(atemp),
+            mean = mean(atemp),
+            median = median(atemp),
+            max = max(atemp), n = n()) %>%
+  arrange(min)
+
+ggplot(aes(x=season, y=atemp), data=bikeShare) +
+  geom_boxplot(aes(fill=season)) +
+  theme(legend.position="none") +
+  xlab("Season") +
+  ylab("Temperature") +
+  ggtitle("\"Feels Like\" Temperature by Season")
+```
+
+I concede. Spring and Fall are the most extreme seasons, whereas Summer
+and Winter are comparatively mild.
+
+*editors note: This could be due to all the hot air being blown
+around by the enormous influx of politicians in the area - more
+research is needed.*
+
+```{r, echo=FALSE}
+ggplot(aes(x=count, y=..density.., fill=weather),
+       data=bikeShare[bikeShare$weather != "Heavy Rain",]) +
+  facet_wrap(~ season) + 
+  scale_x_sqrt() +
+  xlab("Riders") +
+  ylab("Density") +
+  geom_density(alpha = 0.2)
+```
+
+These density plots confirm what we've seen earlier with regard to the number
+of riders during different types of weather.  Cyclists are more likely to ride
+in inclement weather during the Spring or Summer than in the Fall or Winter.
+Even though, as we determined earlier, Fall is the warmest season and Spring
+the coldest.
+
+```{r, echo=FALSE}
+
+probDen <- function(season = "Spring", weather = "Rain") {
+  den <- density(bikeShare[bikeShare$season ==
+                             season & bikeShare$weather == weather,]$count)
+  
+  xt <- diff(den$x[den$x < 1])
+  yt <- rollmean(den$y[den$x < 1], 2)
+  
+  print(paste(season, " - ", weather, " density probability: ",
+              round(sum(xt * yt) * 100, digits=2), "%", sep=""))
+  
+  print(paste("Percentage of Entries that had ", weather, " in the ", 
+              season, ": ",
+              round( 100 * sum(bikeShare$season == season &
+                                 bikeShare$weather == weather) /
+                       sum(bikeShare$season == season),
+                     digits=2),
+              "%",
+            sep=""))
+}
+
+probDen()
+probDen("Fall")
+
+probDen("Summer")
+probDen("Winter")
+```
+
+The above just quantifies this a bit.
+
+# Linear Model for Ridership Counts
+
+I broke the linear models up into casual and registered users as separate
+entities and trained for each using the following formulas:
+
+* **casual** hour + year + humidity + temp + atemp + workingday
+* **registered** hour + year + humidity + atemp + workingday
+
+Casual returned an R-Squared value of **0.461** and Registered only recieved
+**0.31** so we assume it's not going to be a great match.
+
+results were mostly horrible so I opted for a binary tree instead (rpart)...
+
+# rPart Model
+
+```{r, echo=FALSE}
+# Simple rpart
+testing <- fetchData(file="test")
+
+# Casual
+modFit <- train(casual ~ datetime + season + holiday + workingday + weather + temp +
+                  atemp + humidity + windspeed +	hour + month + year + yearmonth,
+                method="rpart",
+                data=bikeShare[bikeShare$casual > 0,])
+
+testing$casual <- predict(modFit, newdata=testing)
+testing[testing$casual < 0, 'casual'] = 0 # Haters (negative people) aren't allowed
+
+fancyRpartPlot(modFit$finalModel)
+
+# Registered
+modFit <- train(registered ~ datetime + season + holiday + workingday + weather +
+                  temp + atemp + humidity + windspeed +  hour + month + year + yearmonth,
+                method="rpart",
+                data=bikeShare[bikeShare$registered > 0,])
+
+testing$registered <- predict(modFit, testing)
+testing[testing$registered < 0, 'registered'] = 0
+
+fancyRpartPlot(modFit$finalModel)
+
+# Combined Values
+testing$count <- round(testing$casual + testing$registered)
+
+plot(testing$count)
+
+# uncomment if you want output files
+submit <- data.frame(datetime = testing$datetime, count = testing$count)
+write.csv(submit, file = "linear_prediction.csv", row.names=FALSE)
+```
+
+Here's the original training data:
+
+```{r, echo=FALSE}
+plot(bikeShare$count)
+```
+
+and the test data after it's been trained:
+
+```{r, echo=FALSE}
+plot(testing$count)
+```
+
+Both shapes should look similar so we don't have a very good algorithm yet.
+We should go back to looking at ways to manipulate the data to make it more
+linear or use a different algorithm altogether such as RandomForest for
+this data set.
+
+# Final Plots and Summary
+
+#### Time
+
+```{r, echo=FALSE}
+p1 <- ggplot(aes(x=hour, y=count), data=bikeShare) +
+  geom_smooth(data=bikeShare[bikeShare$workingday == 1,],
+              aes(color="working day"),
+              method="gam",
+              formula = y ~ s(x, bs = "cs")) +
+  geom_smooth(data=bikeShare[bikeShare$holiday == 1,],
+              aes(color="holiday"),
+              method="gam",
+              formula = y ~ s(x, bs = "cs")) +
+  geom_smooth(aes(color="all days"),
+              method="gam",
+              formula = y ~ s(x, bs = "cs")) +
+  geom_hline(yintercept=mean(bikeShare$count),
+             alpha=0.8,
+             linetype=1) +
+  scale_x_continuous(breaks=seq(0,23,1)) + 
+  theme(legend.title=element_blank()) +
+  ggtitle("All Riders by Hours") +
+  xlab("Hour") +
+  ylab("Riders")
+
+p2 <- ggplot(aes(x=hour, y=count),
+             data=bikeShare[bikeShare$workingday == 1,]) +
+  geom_smooth(method="gam",
+              formula = y ~ s(x, bs = "cs"),
+              aes(color="Registered Riders", y=registered)) +
+  geom_smooth(method="gam",
+              formula = y ~ s(x, bs = "cs"),
+              aes(color="Casual Riders", y=casual)) +
+  geom_hline(yintercept=mean(bikeShare[bikeShare$workingday == 1,]$count),
+             alpha=0.8,
+             linetype=1) +
+  scale_x_continuous(breaks=seq(0,23,1)) +
+  theme(legend.title=element_blank()) +
+  ggtitle("Working Days by Riders per Hour") +
+  xlab("Hour") +
+  ylab("Riders")
+
+p3 <- ggplot(aes(x=hour, y=count),
+             data=bikeShare[bikeShare$holiday == 1,]) +
+  geom_smooth(method="gam", formula = y ~ s(x, bs = "cs"),
+              aes(color="Registered Riders", y=registered)) +
+  geom_smooth(method="gam", formula = y ~ s(x, bs = "cs"),
+              aes(color="Casual Riders", y=casual)) +
+  geom_hline(yintercept=mean(bikeShare[bikeShare$holiday == 1,]$count),
+             alpha=0.8, linetype=1) +
+  scale_x_continuous(breaks=seq(0,23,1)) +
+  theme(legend.title=element_blank()) +
+  ggtitle("Holidays by Riders per Hour") +
+  xlab("Hour") +
+  ylab("Riders")
+
+grid.arrange(p1, p2, p3, ncol=1)
+```
+
+Looking at the top graph we see a red bimodal line on all days. It's more
+extreme as we look at just working days (blue line).  This changes when we look
+at the holidays only, as there is a smooth line that simply rises and drops
+throughout the day.
+
+*The heavy black line is the mean of all riders across all the data.*
+
+In the second image, we break this out to just working days and further into
+casual and  registered riders. Here it's more obvious that registered riders
+are in fact, commuting. Commute times peak shortly before 8am and again near
+6pm.  There is a slight rise around 1pm which I suspect are those using the
+bikes for lunch. In contrast, we don't see any of this behavior in casual
+riders.
+
+Though causual riders bike more on holidays, registered users bike less and
+the peaks are much less defined. This yeilds more evidence that registed
+riders are using these bikes for commuting.
+
+#### Weather
+
+```{r, echo=FALSE}
+ggplot(aes(x=temp, y=count),
+       data=bikeShare) +
+  geom_point(aes(color=weather),
+             position=position_jitter(h=0),
+             alpha=1) +
+  geom_line(stat='summary',
+            fun.y=mean,
+            aes(y=round(registered / 70) * 70,
+                color="- Mean Registerd"),
+            size=2) + 
+  geom_line(stat='summary',
+            fun.y=mean,
+            aes(y=round(casual / 20) * 20,
+                color="- Mean Casual"),
+            size=2) +
+  scale_y_continuous(breaks=seq(0,1000,50)) +
+  scale_x_continuous(breaks=seq(0,45,5)) +
+  theme_solarized(light=FALSE) +
+  theme(legend.title=element_blank()) +
+  ggtitle("Temperature to Ridership by Weather") +
+  xlab("Temperature") +
+  ylab("Riders")
+```
+
+
+Notice that in the lower right, as the temperature goes up it reaches a point
+where there are more and more riders. Eventually there's a point (around
+33C) that really takes off and there's never less than 75 riders.
+I suspect that this is due to these temperatures only ever occuring during 
+the day. It may be interesting that Mist and Rain seems to hover around
+certain temperatures, for instance at the extreme outliers we always see
+clear weather. However, you might recall that at the start of this 
+project we saw that there were significantly more clear days, so I won't
+read too much into that.
+
+
+```{r, echo=FALSE}
+ggplot(aes(x=round(humidity/5)*5, y=count),
+       data=bikeShare[bikeShare$humidity >= 35,]) +
+  facet_wrap(~season) +
+  geom_line(stat='summary',
+            fun.y=mean,
+            aes(group="summary")) +
+  geom_point(stat='summary',
+             fun.y=mean,
+             aes(group="summary")) +
+  geom_line(stat='summary',
+            fun.y=mean,
+            linetype=2,
+            aes(y=registered,
+                group='summary',
+                color='Registered')) +
+  geom_line(stat='summary',
+            fun.y=mean,
+            linetype=2,
+            aes(y=casual,
+                group='summary',
+                colour='Casual')) +
+  scale_x_continuous(breaks=seq(35,100,10), limits=c(35,100)) +
+  coord_trans(y="sqrt") +
+  ggtitle("Average Riders per Humidity") +
+  xlab("Humidity") +
+  ylab("Mean Riders") +
+  scale_y_continuous(breaks=seq(0,500,100)) +
+  theme_wsj() +
+  theme(legend.title=element_blank())
+```
+
+
+Intuitively we understand that as humidity increases ridership should
+drop regardless of the temperature. Though the data supports this
+view the really interesting thing is how much riders avoid the
+humidity based on season.  In the above, we can see that in the 
+Spring people really don't mind the humidity (the mean line is
+basically flat) whereas the steep line in the Fall shows how much
+these changes in humidity cause people to avoid cycling.
+
+#### Conclusion
+
+* Ridership drops as precipitation rises.
+* DC's bikesharing program has grown by over 67% over the two years.
+* Spring and Fall are the most extreme Seasons in DC.
+* The data was sampled according to the Season, hence the matching number of
+hours between the seasons.
+* Cyclists are less picky about riding in poor weather during the Spring than
+they are during the Fall.
+
+# Reflection
+
+The Bicycle Sharing dataset contains over 10,000 records recorded hourly from
+2011-2012. Begining with the total riders (count) and moving on to the
+individual columns we were able to develop questions which were answered as we
+crawled through the dataset. Eventually we were able to develop a picture of
+the dataset and observe how it was built and how it related to ridership.
+
+I was surprised to learn that temperature extremes actually occur in the Spring
+and Fall seasons in Washington DC from 2011-2012...
+
+This is contrary to Wikipedia [http://en.wikipedia.org/wiki/Season] 
+
+*"Meteorological seasons are reckoned by temperature, with summer being the
+hottest quarter of the year and winter the coldest quarter of the year."*
+
+...and my intuition.
+
+#### Other Surprises
+
+* The growth rate was quite significant for ridesharing in DC without
+  a single month experiencing a decline and it needed to be taken into account
+  for several of our conclusions.
+* The single entry for *Heavy Rain* took up more documentation than the
+  amount of data it provided.  
+* Riders love the wind, until it reaches about 25-30 mph.
+* On average, the hotter it gets, the more Riders there are.
+* Most people bike in the evenings.
+* The month plays heavily into whether cyclists will put up with inclement
+weather.
+
+# Prediction Model
+
+The growth rate, the seasons, the registered riders all play a significant role
+in the final counts.  However the temperature, weather, windspeed and humidity
+have very little impact until they are paired with specific months.
+
+The test data has been pulled from within the two years so you should treat this
+data as just missing portions of an already intact dataset.  Further to that we
+see discrepencies between the working days and holidays that should be figured 
+into our final prediction model.  Working days and holidays are boolean values
+and since we have no entries with both (which would be weird) we have to assume
+that if both are FALSE it's probably a weekend.  Given that here's the algorithm:
+
+To predict a given hour we look backwards through the training data from the point
+we are predicting for the same workingday, holiday and hour values.  The first 
+point we come to we'll record the count and day for.  We then perform the same
+method in the forward direction.
+
+We will then weigh these points as linear from the past to the future and
+record the entry as it passes through the test point we are looking for.  In
+this way we are incorporating the most relevant parts of the dataset.
+
+Here's the results:
+
+```{r, echo=FALSE}
+pred <- read.csv('perl_prediction.csv')
+plot(pred$count)
+```
+
+and the original dataset
+
+```{r, echo=FALSE}
+plot(bikeShare$count)
+```
+
+I'm happy with these results.
+
