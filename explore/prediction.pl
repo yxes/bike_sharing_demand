@@ -49,10 +49,9 @@ use warnings;
 # Fill in the location of your training and test dataset
 # expects the data to be named 'train.csv' and 'test.csv' zipped
 #
-use constant DATA_DIR => '../original_data/';
+use constant DATA_DIR => '../data/';
 
-# Ensure these two libraries are installed
-use IO::Uncompress::Unzip qw(unzip $UnzipError);
+# Ensure this library is installed
 use Date::Calc qw(Delta_Days);
 
 #####  START ######
@@ -154,12 +153,11 @@ sub format_day_hour {
 sub fetch_data {
     my($train, $test);
 
-    unzip DATA_DIR. 'train.csv.zip' => \$train, Name => 'train.csv'
-	or die "unzip failed: $UnzipError";
-    
-    unzip DATA_DIR. 'test.csv.zip' => \$test, Name => 'test.csv'
-	or die "unzip failed: $UnzipError";
-
+    local $/ = undef;
+    open(TRAIN, "../data/train.csv") or die "can't open: ../data/train.csv: $!";
+      $train = <TRAIN>;
+    open(TEST, "../data/test.csv") or die "can't open: ../data/test.csv: $!";
+      $test = <TEST>;
 
 return($train, $test)
 }

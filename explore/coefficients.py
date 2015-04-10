@@ -2,7 +2,6 @@
 # -*- coding: utf-8 -*-
 
 # We are using Python 3 here
-import zipfile
 import numpy as np
 import pandas
 import matplotlib.pyplot as plt
@@ -10,7 +9,7 @@ import scipy
 import scipy.stats
 import io
 
-ZIPFILE = '../original_data/train.csv.zip'
+FILE = '../data/train.csv'
 
 def rental_histogram(bikedf):
     '''
@@ -62,14 +61,8 @@ def mann_whitney_plus_means(v1, v2):
 
     return np.mean(v1), np.mean(v2), U, p * 2
 
-def explore(zip_file):
-    csv_file = zip_file[:-4] # strip off the .zip
-    csv_file = csv_file.split('/')[-1] # strip off any directories so we just have the file
-
-    fh = open(zip_file, 'rb')
-    zf = zipfile.ZipFile(fh)
-    data = io.BytesIO(zf.read(csv_file))
-    df = pandas.read_csv(data)
+def explore(training_file):
+    df = pandas.read_csv(training_file)
 
     print('''
     QUESTION
@@ -137,4 +130,4 @@ def explore(zip_file):
     ''')
 
 if __name__ == "__main__":
-    explore(ZIPFILE)
+    explore(FILE)
